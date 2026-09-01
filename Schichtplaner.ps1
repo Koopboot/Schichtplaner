@@ -120,6 +120,9 @@ function Load-State {
         if ($null -eq $task.PSObject.Properties['MinMiddle']) { $task | Add-Member -NotePropertyName MinMiddle -NotePropertyValue 0 }
         if ($null -eq $task.PSObject.Properties['MinLate']) { $task | Add-Member -NotePropertyName MinLate -NotePropertyValue 0 }
         if ($null -eq $task.PSObject.Properties['TargetAssignees']) { $task | Add-Member -NotePropertyName TargetAssignees -NotePropertyValue ($(if([bool]$task.SLA){2}else{1})) }
+        if ($null -eq $task.PSObject.Properties['AssignToAllPresent']) { $task | Add-Member -NotePropertyName AssignToAllPresent -NotePropertyValue $false }
+        if ($null -eq $task.PSObject.Properties['IncompatibleTaskIds']) { $task | Add-Member -NotePropertyName IncompatibleTaskIds -NotePropertyValue @() }
+        else { $task.IncompatibleTaskIds = @(As-Array $task.IncompatibleTaskIds) }
     }
 }
 
@@ -205,6 +208,26 @@ function Remove-TaskFromCurrentPlan {
     }
 }
 
+function Test-TaskPairCompatible {
+    param($TaskA,$TaskB)
+    if ($null -eq $TaskA -or $null -eq $TaskB) { return $true }
+    if ($TaskA.Id -eq $TaskB.Id) { return $true }
+    $aBlocks = @(As-Array $TaskA.IncompatibleTaskIds)
+    $bBlocks = @(As-Array $TaskB.IncompatibleTaskIds)
+    return (-not ($aBlocks -contains $TaskB.Id) -and -not ($bBlocks -contains $TaskA.Id))
+}
+
+function Test-EmployeeTaskCombinationAllowed {
+    param([hashtable]$PlanMap,[string]$EmployeeId,$Task)
+    foreach ($assignedTaskId in @(As-Array $PlanMap[$EmployeeId])) {
+        $assignedTask = @($script:Tasks | Where-Object Id -eq $assignedTaskId) | Select-Object -First 1
+        if ($assignedTask -and (Test-TaskEnabled $assignedTask)) {
+            if (-not (Test-TaskPairCompatible $Task $assignedTask)) { return $false }
+        }
+    }
+    return $true
+}
+
 function Get-BundleBonus {
     param(
         [hashtable]$PlanMap,
@@ -238,6 +261,7 @@ function Select-BestEmployee {
 
     foreach ($emp in $Candidates) {
         if (-not (Can-EmployeeDoTask $emp $Task)) { continue }
+        if (-not (Test-EmployeeTaskCombinationAllowed -PlanMap $PlanMap -EmployeeId $emp.Id -Task $Task)) { continue }
         $load = Get-EmployeeLoad $PlanMap $emp.Id
         $history = Get-HistoryPenalty -EmployeeId $emp.Id -TaskId $Task.Id -SlaTask:$SlaTask
         $sameTaskAlready = if ((@($PlanMap[$emp.Id]) -contains $Task.Id)) { 1000 } else { 0 }
@@ -283,10 +307,14 @@ function Ensure-TaskCoverage {
             $candidates=@($Available | Where-Object { $_.Shift -eq $shift -and -not (@($PlanMap[$_.Id]) -contains $Task.Id) })
             if($candidates.Count -eq 0){ [void]$Warnings.Add("Aufgabe '$($Task.Name)': Mindestabdeckung '$shift' ($required) nicht vollständig möglich."); break }
             $selected=Select-BestEmployee -Candidates $candidates -Task $Task -PlanMap $PlanMap -SlaTask:([bool]$Task.SLA)
-            if($selected){Add-TaskToPlan $PlanMap $selected.Id $Task.Id}else{[void]$Warnings.Add("Aufgabe '$($Task.Name)' konnte für '$shift' nicht zugewiesen werden.");break}
+            if($selected){Add-TaskToPlan $PlanMap $selected.Id $Task.Id}else{[void]$Warnings.Add("Aufgabe '$($Task.Name)' konnte für '$shift' nicht zugewiesen werden (Ausschluss oder 'Nicht kombinieren mit'-Sperre).");break}
         }
     }
-    $target=[Math]::Max(1,[int]$Task.TargetAssignees)
+    if ([bool]$Task.AssignToAllPresent) {
+        $target = @($Available).Count
+    } else {
+        $target = [Math]::Max(1,[int]$Task.TargetAssignees)
+    }
     $minTotal=(Get-TaskMinimumForShift $Task 'Früh')+(Get-TaskMinimumForShift $Task 'Mitte')+(Get-TaskMinimumForShift $Task 'Spät')
     $target=[Math]::Max($target,$minTotal)
     $current=@($Available | Where-Object { @($PlanMap[$_.Id]) -contains $Task.Id }).Count
@@ -294,7 +322,7 @@ function Ensure-TaskCoverage {
         $candidates=@($Available | Where-Object { -not (@($PlanMap[$_.Id]) -contains $Task.Id) })
         if($candidates.Count -eq 0){[void]$Warnings.Add("Aufgabe '$($Task.Name)': gewünschte Gesamtanzahl $target nicht vollständig möglich.");break}
         $selected=Select-BestEmployee -Candidates $candidates -Task $Task -PlanMap $PlanMap -SlaTask:([bool]$Task.SLA)
-        if(-not $selected){[void]$Warnings.Add("Aufgabe '$($Task.Name)' konnte nicht weiter verteilt werden.");break}
+        if(-not $selected){[void]$Warnings.Add("Aufgabe '$($Task.Name)' konnte nicht weiter verteilt werden (Ausschluss oder 'Nicht kombinieren mit'-Sperre).");break}
         Add-TaskToPlan $PlanMap $selected.Id $Task.Id
         $current++
     }
@@ -338,6 +366,7 @@ function Rebalance-Availability {
     foreach ($emp in @(As-Array $WeekEmployees)) { $weekMap[$emp.Id] = $emp }
 
     $lostTasks = New-Object System.Collections.ArrayList
+    $conflictRepairs = New-Object System.Collections.ArrayList
     $plan = @{}
     $availableEmployees = @()
     $newAssignments = @()
@@ -351,9 +380,22 @@ function Rebalance-Availability {
 
         if ($isPresent) {
             $list = New-Object System.Collections.ArrayList
+            # Bestehende Basiszuweisungen werden gegen neue harte Kombinationssperren geprüft.
+            # Höhere Priorität bleibt: SLA zuerst, danach höheres Gewicht.
+            $baselineTasks = @()
             foreach ($tid in @(As-Array $a.TaskIds)) {
                 $task = @($script:Tasks | Where-Object Id -eq $tid) | Select-Object -First 1
-                if ($task -and (Test-TaskEnabled $task)) { [void]$list.Add($tid) }
+                if ($task -and (Test-TaskEnabled $task)) { $baselineTasks += $task }
+            }
+            $baselineTasks = @($baselineTasks | Sort-Object @{Expression={if($_.SLA){0}else{1}}}, @{Expression={[int]$_.Weight};Descending=$true}, @{Expression={$_.Name}})
+            $tempPlan = @{}; $tempPlan[$a.EmployeeId] = $list
+            foreach ($task in $baselineTasks) {
+                if (Test-EmployeeTaskCombinationAllowed -PlanMap $tempPlan -EmployeeId $a.EmployeeId -Task $task) {
+                    [void]$list.Add($task.Id)
+                } else {
+                    [void]$lostTasks.Add([pscustomobject]@{ TaskId=$task.Id; OriginShift=$shift })
+                    [void]$conflictRepairs.Add("'$($task.Name)' wurde bei '$($a.EmployeeName)' wegen einer harten Kombinationssperre entfernt und neu verteilt.")
+                }
             }
             $plan[$a.EmployeeId] = $list
 
@@ -401,6 +443,7 @@ function Rebalance-Availability {
     }
 
     $warnings = New-Object System.Collections.ArrayList
+    foreach($msg in @($conflictRepairs)){[void]$warnings.Add($msg)}
     # Nach einem Ausfall bleiben bestehende Zuweisungen erhalten. Danach wird für jede aktive Aufgabe
     # nur fehlende Mindest-/Zielabdeckung ergänzt. So können auch mehrere Ausfälle gleichzeitig repariert werden.
     foreach($task in @($script:Tasks | Where-Object {Test-TaskEnabled $_} | Sort-Object @{Expression={if($_.SLA){0}else{1}}}, @{Expression={[int]$_.Weight};Descending=$true})){
@@ -537,43 +580,81 @@ function Show-EmployeeManager {
 }
 
 function Show-TaskManager {
-    $form=New-Object System.Windows.Forms.Form; $form.Text='Aufgaben verwalten'; $form.Width=1120; $form.Height=500; $form.StartPosition='CenterParent'
-    $list=New-Object System.Windows.Forms.ListView; $list.View='Details'; $list.FullRowSelect=$true; $list.GridLines=$true; $list.Left=10; $list.Top=10; $list.Width=1080; $list.Height=350
-    [void]$list.Columns.Add('Aufgabe',230);[void]$list.Columns.Add('Aktiv',55);[void]$list.Columns.Add('SLA',55);[void]$list.Columns.Add('Gew.',50);[void]$list.Columns.Add('Bündelgruppe',180);[void]$list.Columns.Add('Früh min.',70);[void]$list.Columns.Add('Mitte min.',75);[void]$list.Columns.Add('Spät min.',70);[void]$list.Columns.Add('Ziel ges.',70)
-    function Refresh-TaskList {$list.Items.Clear();foreach($t in $script:Tasks){$it=New-Object System.Windows.Forms.ListViewItem($t.Name);[void]$it.SubItems.Add($(if(Test-TaskEnabled $t){'Ja'}else{'Nein'}));[void]$it.SubItems.Add($(if($t.SLA){'Ja'}else{'Nein'}));[void]$it.SubItems.Add([string]$t.Weight);[void]$it.SubItems.Add([string]$t.BundleGroup);[void]$it.SubItems.Add([string]$t.MinEarly);[void]$it.SubItems.Add([string]$t.MinMiddle);[void]$it.SubItems.Add([string]$t.MinLate);[void]$it.SubItems.Add([string]$t.TargetAssignees);$it.Tag=$t.Id;[void]$list.Items.Add($it)}}
-    $add=New-Object System.Windows.Forms.Button;$add.Text='Hinzufügen';$add.Left=10;$add.Top=375;$add.Width=100
-    $edit=New-Object System.Windows.Forms.Button;$edit.Text='Bearbeiten';$edit.Left=118;$edit.Top=375;$edit.Width=100
-    $toggle=New-Object System.Windows.Forms.Button;$toggle.Text='Aktiv/Deaktiv';$toggle.Left=226;$toggle.Top=375;$toggle.Width=110
-    $remove=New-Object System.Windows.Forms.Button;$remove.Text='Entfernen';$remove.Left=344;$remove.Top=375;$remove.Width=100
-    $close=New-Object System.Windows.Forms.Button;$close.Text='Schließen';$close.Left=990;$close.Top=375;$close.Width=100
-    function Edit-Task($task){
-        $tf=New-Object System.Windows.Forms.Form;$tf.Text=$(if($task){'Aufgabe bearbeiten'}else{'Aufgabe hinzufügen'});$tf.Width=540;$tf.Height=500;$tf.StartPosition='CenterParent'
-        $l1=New-Object System.Windows.Forms.Label;$l1.Text='Name:';$l1.Left=12;$l1.Top=18;$l1.Width=110
-        $name=New-Object System.Windows.Forms.TextBox;$name.Left=135;$name.Top=15;$name.Width=365;if($task){$name.Text=$task.Name}
-        $enabled=New-Object System.Windows.Forms.CheckBox;$enabled.Text='Aufgabe aktiv';$enabled.Left=135;$enabled.Top=52;$enabled.Checked=$(if($task){Test-TaskEnabled $task}else{$true})
-        $sla=New-Object System.Windows.Forms.CheckBox;$sla.Text='SLA-relevant (erzwingt mind. Früh 1 + Spät 1)';$sla.Left=135;$sla.Top=78;$sla.Width=340;if($task){$sla.Checked=[bool]$task.SLA}
-        $l2=New-Object System.Windows.Forms.Label;$l2.Text='Gewicht:';$l2.Left=12;$l2.Top=116;$l2.Width=110
-        $weight=New-Object System.Windows.Forms.NumericUpDown;$weight.Left=135;$weight.Top=113;$weight.Minimum=1;$weight.Maximum=20;$weight.Value=$(if($task){[decimal]$task.Weight}else{1})
-        $l3=New-Object System.Windows.Forms.Label;$l3.Text='Bündelgruppe:';$l3.Left=12;$l3.Top=153;$l3.Width=110
-        $group=New-Object System.Windows.Forms.ComboBox;$group.Left=135;$group.Top=149;$group.Width=365;$group.DropDownStyle='DropDown';$existingGroups=@($script:Tasks|ForEach-Object{[string]$_.BundleGroup}|Where-Object{-not[string]::IsNullOrWhiteSpace($_)}|Sort-Object -Unique);if($existingGroups.Count){[void]$group.Items.AddRange([object[]]$existingGroups)};if($task){$group.Text=[string]$task.BundleGroup}
-        $sep=New-Object System.Windows.Forms.Label;$sep.Text='Schichtabdeckung (Mindestanzahl):';$sep.Left=12;$sep.Top=205;$sep.Width=250;$sep.Font=New-Object System.Drawing.Font('Segoe UI',9,[System.Drawing.FontStyle]::Bold)
-        $le=New-Object System.Windows.Forms.Label;$le.Text='Früh:';$le.Left=40;$le.Top=242;$le.Width=50
-        $early=New-Object System.Windows.Forms.NumericUpDown;$early.Left=90;$early.Top=239;$early.Minimum=0;$early.Maximum=20;$early.Width=55;$early.Value=$(if($task){[decimal]$task.MinEarly}else{0})
-        $lm=New-Object System.Windows.Forms.Label;$lm.Text='Mitte:';$lm.Left=170;$lm.Top=242;$lm.Width=50
-        $middle=New-Object System.Windows.Forms.NumericUpDown;$middle.Left=225;$middle.Top=239;$middle.Minimum=0;$middle.Maximum=20;$middle.Width=55;$middle.Value=$(if($task){[decimal]$task.MinMiddle}else{0})
-        $ll=New-Object System.Windows.Forms.Label;$ll.Text='Spät:';$ll.Left=305;$ll.Top=242;$ll.Width=50
-        $late=New-Object System.Windows.Forms.NumericUpDown;$late.Left=355;$late.Top=239;$late.Minimum=0;$late.Maximum=20;$late.Width=55;$late.Value=$(if($task){[decimal]$task.MinLate}else{0})
-        $lt=New-Object System.Windows.Forms.Label;$lt.Text='Gewünschte Mitarbeiter insgesamt:';$lt.Left=12;$lt.Top=292;$lt.Width=230
-        $target=New-Object System.Windows.Forms.NumericUpDown;$target.Left=250;$target.Top=289;$target.Minimum=1;$target.Maximum=30;$target.Width=60;$target.Value=$(if($task){[decimal]$task.TargetAssignees}else{1})
-        $hint=New-Object System.Windows.Forms.Label;$hint.Text='Beispiel „Bearbeitung“: Früh min. 1, Mitte 0, Spät 0, Ziel gesamt 2. Dann muss morgens jemand starten; eine zweite Person darf aus jeder Schicht kommen.';$hint.Left=12;$hint.Top=330;$hint.Width=488;$hint.Height=55
-        $ok=New-Object System.Windows.Forms.Button;$ok.Text='Speichern';$ok.Left=335;$ok.Top=405;$ok.Width=80
-        $cancel=New-Object System.Windows.Forms.Button;$cancel.Text='Abbrechen';$cancel.Left=422;$cancel.Top=405;$cancel.Width=80
-        $ok.Add_Click({if([string]::IsNullOrWhiteSpace($name.Text)){return};if($task){$wasEnabled=Test-TaskEnabled $task;$task.Name=$name.Text.Trim();$task.Enabled=[bool]$enabled.Checked;$task.SLA=[bool]$sla.Checked;$task.Weight=[int]$weight.Value;$task.BundleGroup=$group.Text.Trim();$task.MinEarly=[int]$early.Value;$task.MinMiddle=[int]$middle.Value;$task.MinLate=[int]$late.Value;$task.TargetAssignees=[int]$target.Value;if($wasEnabled -and -not $task.Enabled){Remove-TaskFromCurrentPlan $task.Id}}else{$script:Tasks=@($script:Tasks)+[pscustomobject]@{Id=(New-Id);Name=$name.Text.Trim();Enabled=[bool]$enabled.Checked;SLA=[bool]$sla.Checked;Weight=[int]$weight.Value;BundleGroup=$group.Text.Trim();MinEarly=[int]$early.Value;MinMiddle=[int]$middle.Value;MinLate=[int]$late.Value;TargetAssignees=[int]$target.Value}};Save-Tasks;$tf.Close();Refresh-TaskList})
-        $cancel.Add_Click({$tf.Close()});$tf.Controls.AddRange(@($l1,$name,$enabled,$sla,$l2,$weight,$l3,$group,$sep,$le,$early,$lm,$middle,$ll,$late,$lt,$target,$hint,$ok,$cancel));[void]$tf.ShowDialog($form)
+    $form=New-Object System.Windows.Forms.Form; $form.Text='Aufgaben verwalten'; $form.Width=1120; $form.Height=520; $form.StartPosition='CenterParent'
+    $list=New-Object System.Windows.Forms.ListView; $list.View='Details'; $list.FullRowSelect=$true; $list.GridLines=$true; $list.Left=10; $list.Top=10; $list.Width=1080; $list.Height=370
+    [void]$list.Columns.Add('Aufgabe',210);[void]$list.Columns.Add('Aktiv',50);[void]$list.Columns.Add('SLA',50);[void]$list.Columns.Add('Gew.',50);[void]$list.Columns.Add('Bündelgruppe',150);[void]$list.Columns.Add('Nicht kombinieren mit',250);[void]$list.Columns.Add('Früh min.',65);[void]$list.Columns.Add('Mitte min.',70);[void]$list.Columns.Add('Spät min.',65);[void]$list.Columns.Add('Ziel',55);[void]$list.Columns.Add('Alle',45)
+    function Refresh-TaskList {
+        $list.Items.Clear()
+        foreach($t in $script:Tasks){
+            $blockedNames=@()
+            foreach($bid in @(As-Array $t.IncompatibleTaskIds)){
+                $bt=@($script:Tasks|Where-Object Id -eq $bid)|Select-Object -First 1
+                if($bt){$blockedNames += $bt.Name}
+            }
+            $it=New-Object System.Windows.Forms.ListViewItem($t.Name)
+            [void]$it.SubItems.Add($(if(Test-TaskEnabled $t){'Ja'}else{'Nein'}));[void]$it.SubItems.Add($(if($t.SLA){'Ja'}else{'Nein'}));[void]$it.SubItems.Add([string]$t.Weight);[void]$it.SubItems.Add([string]$t.BundleGroup);[void]$it.SubItems.Add(($blockedNames -join ', '));[void]$it.SubItems.Add([string]$t.MinEarly);[void]$it.SubItems.Add([string]$t.MinMiddle);[void]$it.SubItems.Add([string]$t.MinLate);[void]$it.SubItems.Add([string]$t.TargetAssignees);[void]$it.SubItems.Add($(if([bool]$t.AssignToAllPresent){'Ja'}else{'Nein'}));$it.Tag=$t.Id;[void]$list.Items.Add($it)
+        }
     }
-    $add.Add_Click({Edit-Task $null});$edit.Add_Click({if($list.SelectedItems.Count){$id=$list.SelectedItems[0].Tag;$t=@($script:Tasks|Where-Object Id -eq $id)|Select-Object -First 1;Edit-Task $t}})
+    $add=New-Object System.Windows.Forms.Button;$add.Text='Hinzufügen';$add.Left=10;$add.Top=395;$add.Width=100
+    $edit=New-Object System.Windows.Forms.Button;$edit.Text='Bearbeiten';$edit.Left=118;$edit.Top=395;$edit.Width=100
+    $toggle=New-Object System.Windows.Forms.Button;$toggle.Text='Aktiv / Deaktiv';$toggle.Left=226;$toggle.Top=395;$toggle.Width=120
+    $remove=New-Object System.Windows.Forms.Button;$remove.Text='Entfernen';$remove.Left=354;$remove.Top=395;$remove.Width=100
+    $close=New-Object System.Windows.Forms.Button;$close.Text='Schließen';$close.Left=990;$close.Top=395;$close.Width=100
+
+    function Edit-Task($task) {
+        $tf=New-Object System.Windows.Forms.Form;$tf.Text=$(if($task){'Aufgabe bearbeiten'}else{'Aufgabe hinzufügen'});$tf.Width=660;$tf.Height=650;$tf.StartPosition='CenterParent'
+        $l1=New-Object System.Windows.Forms.Label;$l1.Text='Name:';$l1.Left=12;$l1.Top=18;$l1.Width=110
+        $name=New-Object System.Windows.Forms.TextBox;$name.Left=135;$name.Top=15;$name.Width=480;if($task){$name.Text=$task.Name}
+        $enabled=New-Object System.Windows.Forms.CheckBox;$enabled.Text='Aufgabe aktiv';$enabled.Left=135;$enabled.Top=52;$enabled.Checked=$(if($task){Test-TaskEnabled $task}else{$true})
+        $sla=New-Object System.Windows.Forms.CheckBox;$sla.Text='SLA-relevant';$sla.Left=285;$sla.Top=52;if($task){$sla.Checked=[bool]$task.SLA}
+        $l2=New-Object System.Windows.Forms.Label;$l2.Text='Gewicht:';$l2.Left=12;$l2.Top=92;$l2.Width=110
+        $weight=New-Object System.Windows.Forms.NumericUpDown;$weight.Left=135;$weight.Top=89;$weight.Minimum=1;$weight.Maximum=20;$weight.Value=$(if($task){[decimal]$task.Weight}else{1})
+        $hint=New-Object System.Windows.Forms.Label;$hint.Text='1 = leicht, höhere Zahl = mehr Arbeitslast';$hint.Left=245;$hint.Top=92;$hint.Width=320
+        $l3=New-Object System.Windows.Forms.Label;$l3.Text='Bündelgruppe:';$l3.Left=12;$l3.Top=133;$l3.Width=110
+        $group=New-Object System.Windows.Forms.ComboBox;$group.Left=135;$group.Top=129;$group.Width=480;$group.DropDownStyle='DropDown';$existingGroups=@($script:Tasks|ForEach-Object{[string]$_.BundleGroup}|Where-Object{-not[string]::IsNullOrWhiteSpace($_)}|Sort-Object -Unique);if($existingGroups.Count){[void]$group.Items.AddRange([object[]]$existingGroups)};if($task){$group.Text=[string]$task.BundleGroup}
+        $groupHint=New-Object System.Windows.Forms.Label;$groupHint.Text='Gleiche Bündelgruppe = bevorzugt zusammen (weiche Regel).';$groupHint.Left=135;$groupHint.Top=157;$groupHint.Width=480
+
+        $blockLabel=New-Object System.Windows.Forms.Label;$blockLabel.Text='Nicht kombinieren mit:';$blockLabel.Left=12;$blockLabel.Top=195;$blockLabel.Width=120
+        $blocked=New-Object System.Windows.Forms.CheckedListBox;$blocked.Left=135;$blocked.Top=190;$blocked.Width=480;$blocked.Height=120;$blocked.CheckOnClick=$true
+        $otherTasks=@($script:Tasks|Where-Object{$null -eq $task -or $_.Id -ne $task.Id}|Sort-Object Name)
+        foreach($ot in $otherTasks){$idx=$blocked.Items.Add($ot.Name);if($task -and ((As-Array $task.IncompatibleTaskIds)-contains $ot.Id)){$blocked.SetItemChecked($idx,$true)}}
+        $blockHint=New-Object System.Windows.Forms.Label;$blockHint.Text='Harte Sperre: Diese Aufgaben dürfen nicht bei derselben Person liegen.';$blockHint.Left=135;$blockHint.Top=315;$blockHint.Width=480
+
+        $cov=New-Object System.Windows.Forms.GroupBox;$cov.Text='Schichtabdeckung';$cov.Left=12;$cov.Top=350;$cov.Width=603;$cov.Height=145
+        $le=New-Object System.Windows.Forms.Label;$le.Text='Früh min.';$le.Left=18;$le.Top=31;$le.Width=70
+        $early=New-Object System.Windows.Forms.NumericUpDown;$early.Left=88;$early.Top=28;$early.Minimum=0;$early.Maximum=20;$early.Width=55;$early.Value=$(if($task){[decimal]$task.MinEarly}else{0})
+        $lm=New-Object System.Windows.Forms.Label;$lm.Text='Mitte min.';$lm.Left=175;$lm.Top=31;$lm.Width=70
+        $middle=New-Object System.Windows.Forms.NumericUpDown;$middle.Left=245;$middle.Top=28;$middle.Minimum=0;$middle.Maximum=20;$middle.Width=55;$middle.Value=$(if($task){[decimal]$task.MinMiddle}else{0})
+        $ll=New-Object System.Windows.Forms.Label;$ll.Text='Spät min.';$ll.Left=330;$ll.Top=31;$ll.Width=65
+        $late=New-Object System.Windows.Forms.NumericUpDown;$late.Left=395;$late.Top=28;$late.Minimum=0;$late.Maximum=20;$late.Width=55;$late.Value=$(if($task){[decimal]$task.MinLate}else{0})
+        $lt=New-Object System.Windows.Forms.Label;$lt.Text='Gewünschte Mitarbeiter gesamt:';$lt.Left=18;$lt.Top=76;$lt.Width=205
+        $target=New-Object System.Windows.Forms.NumericUpDown;$target.Left=225;$target.Top=73;$target.Minimum=1;$target.Maximum=50;$target.Width=60;$target.Value=$(if($task){[decimal]$task.TargetAssignees}else{1})
+        $all=New-Object System.Windows.Forms.CheckBox;$all.Text='Allen anwesenden Mitarbeitern zuweisen';$all.Left=18;$all.Top=108;$all.Width=270;$all.Checked=$(if($task){[bool]$task.AssignToAllPresent}else{$false})
+        $allHint=New-Object System.Windows.Forms.Label;$allHint.Text='Dann wird die Zielanzahl automatisch aus der aktuellen Anwesenheit berechnet.';$allHint.Left=300;$allHint.Top=109;$allHint.Width=285
+        $all.Add_CheckedChanged({$target.Enabled=-not $all.Checked})
+        $target.Enabled=-not $all.Checked
+        $cov.Controls.AddRange(@($le,$early,$lm,$middle,$ll,$late,$lt,$target,$all,$allHint))
+
+        $ok=New-Object System.Windows.Forms.Button;$ok.Text='Speichern';$ok.Left=445;$ok.Top=525;$ok.Width=80
+        $cancel=New-Object System.Windows.Forms.Button;$cancel.Text='Abbrechen';$cancel.Left=535;$cancel.Top=525;$cancel.Width=80
+        $ok.Add_Click({
+            if([string]::IsNullOrWhiteSpace($name.Text)){return}
+            $blockedIds=@()
+            for($i=0;$i -lt $blocked.Items.Count;$i++){if($blocked.GetItemChecked($i)){$blockedIds += $otherTasks[$i].Id}}
+            if($task){
+                $wasEnabled=Test-TaskEnabled $task;$task.Name=$name.Text.Trim();$task.Enabled=[bool]$enabled.Checked;$task.SLA=[bool]$sla.Checked;$task.Weight=[int]$weight.Value;$task.BundleGroup=$group.Text.Trim();$task.IncompatibleTaskIds=@($blockedIds);$task.MinEarly=[int]$early.Value;$task.MinMiddle=[int]$middle.Value;$task.MinLate=[int]$late.Value;$task.TargetAssignees=[int]$target.Value;$task.AssignToAllPresent=[bool]$all.Checked;if($wasEnabled -and -not $task.Enabled){Remove-TaskFromCurrentPlan $task.Id}
+            }else{
+                $script:Tasks=@($script:Tasks)+[pscustomobject]@{Id=(New-Id);Name=$name.Text.Trim();Enabled=[bool]$enabled.Checked;SLA=[bool]$sla.Checked;Weight=[int]$weight.Value;BundleGroup=$group.Text.Trim();IncompatibleTaskIds=@($blockedIds);MinEarly=[int]$early.Value;MinMiddle=[int]$middle.Value;MinLate=[int]$late.Value;TargetAssignees=[int]$target.Value;AssignToAllPresent=[bool]$all.Checked}
+            }
+            Save-Tasks;$tf.Close();Refresh-TaskList
+        })
+        $cancel.Add_Click({$tf.Close()})
+        $tf.Controls.AddRange(@($l1,$name,$enabled,$sla,$l2,$weight,$hint,$l3,$group,$groupHint,$blockLabel,$blocked,$blockHint,$cov,$ok,$cancel));[void]$tf.ShowDialog($form)
+    }
+    $add.Add_Click({Edit-Task $null})
+    $edit.Add_Click({if($list.SelectedItems.Count){$id=$list.SelectedItems[0].Tag;$t=@($script:Tasks|Where-Object Id -eq $id)|Select-Object -First 1;Edit-Task $t}})
     $toggle.Add_Click({if($list.SelectedItems.Count){$id=$list.SelectedItems[0].Tag;$t=@($script:Tasks|Where-Object Id -eq $id)|Select-Object -First 1;if($t){$newState=-not(Test-TaskEnabled $t);$t.Enabled=$newState;if(-not $newState){Remove-TaskFromCurrentPlan $t.Id};Save-Tasks;Refresh-TaskList}}})
-    $remove.Add_Click({if($list.SelectedItems.Count){$id=$list.SelectedItems[0].Tag;if([System.Windows.Forms.MessageBox]::Show('Aufgabe wirklich entfernen?','Bestätigen','YesNo','Question') -eq 'Yes'){$script:Tasks=@($script:Tasks|Where-Object Id -ne $id);foreach($e in $script:Employees){$e.ExcludedTaskIds=@(As-Array $e.ExcludedTaskIds|Where-Object{$_ -ne $id})};Remove-TaskFromCurrentPlan $id;Save-Tasks;Save-Employees;Refresh-TaskList}}})
+    $remove.Add_Click({if($list.SelectedItems.Count){$id=$list.SelectedItems[0].Tag;if([System.Windows.Forms.MessageBox]::Show('Aufgabe wirklich entfernen?','Bestätigen','YesNo','Question') -eq 'Yes'){$script:Tasks=@($script:Tasks|Where-Object Id -ne $id);foreach($e in $script:Employees){$e.ExcludedTaskIds=@(As-Array $e.ExcludedTaskIds|Where-Object{$_ -ne $id})};foreach($t in $script:Tasks){$t.IncompatibleTaskIds=@(As-Array $t.IncompatibleTaskIds|Where-Object{$_ -ne $id})};Save-Tasks;Save-Employees;Refresh-TaskList}}})
     $close.Add_Click({$form.Close()});$form.Controls.AddRange(@($list,$add,$edit,$toggle,$remove,$close));Refresh-TaskList;[void]$form.ShowDialog()
 }
 
@@ -683,7 +764,7 @@ $btnRegenerate.Add_Click({
     try{
         $weekEmployees=Collect-WeekEmployees
         $answer=[System.Windows.Forms.MessageBox]::Show(
-            "Der aktuelle Wochenplan wird vollständig neu berechnet. Bestehende Zuweisungen dieser Woche werden dabei nicht beibehalten.`n`nDie Historie vorheriger Wochen, SLA, Gewichte, Ausschlüsse und Bündelgruppen werden weiterhin berücksichtigt.`n`nFortfahren?",
+            "Der aktuelle Wochenplan wird vollständig neu berechnet. Bestehende Zuweisungen dieser Woche werden dabei nicht beibehalten.`n`nDie Historie vorheriger Wochen, SLA, Gewichte, Ausschlüsse, Bündelgruppen und harte Kombinationssperren werden weiterhin berücksichtigt.`n`nFortfahren?",
             'Plan neu generieren','YesNo','Question')
         if($answer -ne [System.Windows.Forms.DialogResult]::Yes){return}
         $result=Generate-WeeklyPlan $weekEmployees
